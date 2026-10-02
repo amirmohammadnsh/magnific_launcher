@@ -25,23 +25,40 @@ export default class MagnificLauncher extends Extension {
         // Delay initial attach to let the overview controls finish initializing.
         // The default GNOME dash is inside the overview and may not be interactive
         // until the overview has been shown at least once.
-        this._retryTimeoutIds = [];
+        this._retryTimeoutIds = new Set();
         const id = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 500, () => {
+            this._retryTimeoutIds.delete(id);
             this._attachToDocks();
-            this._retryTimeoutIds = [];
             return GLib.SOURCE_REMOVE;
         });
-        this._retryTimeoutIds.push(id);
+        this._retryTimeoutIds.add(id);
 
         // If the dash was not yet ready, keep retrying.
         const delays = [1500, 3000, 5000, 8000, 12000];
         for (const delay of delays) {
             const tid = GLib.timeout_add(GLib.PRIORITY_DEFAULT, delay, () => {
+                this._retryTimeoutIds.delete(tid);
                 if (this._controllers.length === 0) this._attachToDocks();
                 return GLib.SOURCE_REMOVE;
             });
-            this._retryTimeoutIds.push(tid);
+            this._retryTimeoutIds.add(tid);
         }
+
+        // Monitor hot-plug rebuilds monitor-dependent dash actors. Re-discover
+        // them after Mutter and other extensions have finished their relayout.
+        this._monitorReattachTimeoutId = null;
+        this._monitorsChangedId = Main.layoutManager.connect('monitors-changed', () => {
+            if (this._monitorReattachTimeoutId !== null)
+                GLib.source_remove(this._monitorReattachTimeoutId);
+
+            this._monitorReattachTimeoutId = GLib.timeout_add(
+                GLib.PRIORITY_DEFAULT, 500, () => {
+                    this._monitorReattachTimeoutId = null;
+                    this._detachAll();
+                    this._attachToDocks();
+                    return GLib.SOURCE_REMOVE;
+                });
+        });
 
         // Re-attach when the overview opens/closes (the dash becomes
         // interactive when the overview shows for the first time).
@@ -57,6 +74,14 @@ export default class MagnificLauncher extends Extension {
     }
 
     disable() {
+        if (this._monitorsChangedId) {
+            Main.layoutManager.disconnect(this._monitorsChangedId);
+            this._monitorsChangedId = null;
+        }
+        if (this._monitorReattachTimeoutId !== null) {
+            GLib.source_remove(this._monitorReattachTimeoutId);
+            this._monitorReattachTimeoutId = null;
+        }
         if (this._overviewHiddenId) {
             Main.overview.disconnect(this._overviewHiddenId);
             this._overviewHiddenId = null;
@@ -68,7 +93,7 @@ export default class MagnificLauncher extends Extension {
         for (const id of this._retryTimeoutIds ?? []) {
             GLib.source_remove(id);
         }
-        this._retryTimeoutIds = [];
+        this._retryTimeoutIds?.clear();
         this._detachAll();
         _settings = null;
     }
