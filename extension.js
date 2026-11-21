@@ -46,19 +46,10 @@ export default class MagnificLauncher extends Extension {
 
         // Monitor hot-plug rebuilds monitor-dependent dash actors. Re-discover
         // them after Mutter and other extensions have finished their relayout.
-        this._monitorReattachTimeoutId = null;
-        this._monitorsChangedId = Main.layoutManager.connect('monitors-changed', () => {
-            if (this._monitorReattachTimeoutId !== null)
-                GLib.source_remove(this._monitorReattachTimeoutId);
-
-            this._monitorReattachTimeoutId = GLib.timeout_add(
-                GLib.PRIORITY_DEFAULT, 500, () => {
-                    this._monitorReattachTimeoutId = null;
-                    this._detachAll();
-                    this._attachToDocks();
-                    return GLib.SOURCE_REMOVE;
-                });
-        });
+        this._reattachTimeoutId = null;
+        this._reattachFull = false;
+        this._monitorsChangedId = Main.layoutManager.connect('monitors-changed',
+            () => this._scheduleReattach(true));
 
         // Re-attach when the overview opens/closes (the dash becomes
         // interactive when the overview shows for the first time).
@@ -78,9 +69,9 @@ export default class MagnificLauncher extends Extension {
             Main.layoutManager.disconnect(this._monitorsChangedId);
             this._monitorsChangedId = null;
         }
-        if (this._monitorReattachTimeoutId !== null) {
-            GLib.source_remove(this._monitorReattachTimeoutId);
-            this._monitorReattachTimeoutId = null;
+        if (this._reattachTimeoutId !== null) {
+            GLib.source_remove(this._reattachTimeoutId);
+            this._reattachTimeoutId = null;
         }
         if (this._overviewHiddenId) {
             Main.overview.disconnect(this._overviewHiddenId);
@@ -102,7 +93,8 @@ export default class MagnificLauncher extends Extension {
         const docks = _findDashContainers();
         for (const {eventActor, iconsActor, showAppsIcon} of docks) {
             if (!eventActor || this._controllers.some(c => c.eventActor === eventActor)) continue;
-            const ctrl = new DockMagnifier(eventActor, iconsActor, showAppsIcon);
+            const ctrl = new DockMagnifier(eventActor, iconsActor, showAppsIcon,
+                c => this._onControllerDestroyed(c));
             ctrl.attach();
             this._controllers.push(ctrl);
         }
@@ -116,6 +108,35 @@ export default class MagnificLauncher extends Extension {
             ctrl.detach();
         }
         this._controllers = [];
+    }
+
+    /**
+     * A dock destroyed its actors (e.g. Ubuntu Dock / Dash to Dock recreate
+     * their docks when some of their settings change). Drop the dead
+     * controller and re-discover the replacement dock.
+     */
+    _onControllerDestroyed(ctrl) {
+        this._controllers = this._controllers.filter(c => c !== ctrl);
+        this._scheduleReattach(false);
+    }
+
+    /**
+     * Debounced re-discovery. With `full`, every controller is detached first
+     * (monitor changes); otherwise only missing docks are attached.
+     */
+    _scheduleReattach(full) {
+        this._reattachFull ||= full;
+        if (this._reattachTimeoutId !== null)
+            GLib.source_remove(this._reattachTimeoutId);
+
+        this._reattachTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 500, () => {
+            this._reattachTimeoutId = null;
+            if (this._reattachFull)
+                this._detachAll();
+            this._reattachFull = false;
+            this._attachToDocks();
+            return GLib.SOURCE_REMOVE;
+        });
     }
 }
 
@@ -222,13 +243,20 @@ class DockMagnifier {
      * @param {Clutter.Actor} eventActor   Reactive actor that receives pointer events.
      * @param {Clutter.Actor} iconsActor   Actor whose direct children are the icon buttons.
      * @param {Clutter.Actor|null} showAppsIcon  Show Applications button.
+     * @param {Function|null} onDestroyed  Called when the dock actors are destroyed.
      */
-    constructor(eventActor, iconsActor, showAppsIcon = null) {
+    constructor(eventActor, iconsActor, showAppsIcon = null, onDestroyed = null) {
         this.eventActor = eventActor;
         this._iconsActor = iconsActor ?? eventActor;
         this._showAppsIcon = showAppsIcon;
+        this._onDestroyed = onDestroyed;
+        this._destroyed = false;
 
         this._icons = [];
+        // The cache is rebuilt lazily on pointer events: icons added by the
+        // dock start at zero size (GNOME's DashItemContainer entrance
+        // animation), so a snapshot taken on child-added would miss them.
+        this._cacheDirty = true;
         this._hoveredIndex = -1;
         this._restoreTimeoutId = null;
         this._signalIds = [];
@@ -242,7 +270,9 @@ class DockMagnifier {
         this._refreshIconCache();
 
         try {
-            this._connect(this.eventActor, 'destroy', this._onEventActorDestroyed.bind(this));
+            this._connect(this.eventActor, 'destroy', this._onActorDestroyed.bind(this));
+            if (this._iconsActor !== this.eventActor)
+                this._connect(this._iconsActor, 'destroy', this._onActorDestroyed.bind(this));
             this._connect(this.eventActor, 'enter-event', this._onEnter.bind(this));
             this._connect(this.eventActor, 'leave-event', this._onLeave.bind(this));
             this._connect(this.eventActor, 'motion-event', this._onMotion.bind(this));
@@ -253,7 +283,7 @@ class DockMagnifier {
 
         for (const sig of ['child-added', 'child-removed']) {
             try {
-                this._connect(this._iconsActor, sig, this._refreshIconCache.bind(this));
+                this._connect(this._iconsActor, sig, () => (this._cacheDirty = true));
             } catch (_) {}
         }
     }
@@ -278,31 +308,68 @@ class DockMagnifier {
         this._hoveredIndex = -1;
     }
 
-    _onEventActorDestroyed() {
+    _onActorDestroyed() {
+        if (this._destroyed) return;
+        this._destroyed = true;
         this._cancelRestoreTimeout();
+        // Disconnect from whichever actors are still alive (the icons actor
+        // may outlive the event actor, or vice versa).
+        for (const {actor, id} of this._signalIds) {
+            if (_isActorAlive(actor)) {
+                try { actor.disconnect(id); } catch (_) {}
+            }
+        }
         this._signalIds = [];
         this._icons = [];
         this._hoveredIndex = -1;
+        this._onDestroyed?.(this);
     }
 
     // ── Icon cache ─────────────────────────────────────────────────────────────
 
+    /**
+     * Rebuilds the icon cache if it is stale. Returns true when the set of
+     * cached icons changed.
+     */
+    _ensureIconCache() {
+        if (!this._cacheDirty) return false;
+        return this._refreshIconCache();
+    }
+
     _refreshIconCache() {
-        if (!_isActorAlive(this._iconsActor)) return;
+        if (!_isActorAlive(this._iconsActor)) return false;
         const MIN_ICON_SIZE = 16;
-        this._icons = this._iconsActor.get_children().filter(child => {
+        // Set when a real icon is skipped only because it is still animating
+        // in (or not allocated yet): keep the cache dirty so it is picked up
+        // on a later motion event.
+        let pending = false;
+        const icons = this._iconsActor.get_children().filter(child => {
             if (!child.visible) return false;
-            const w = child.get_width();
-            const h = child.get_height();
-            if (w < MIN_ICON_SIZE || h < MIN_ICON_SIZE) return false;
             const cls = (child.style_class || '').toLowerCase();
             const name = (child.get_name() || '').toLowerCase();
             if (cls.includes('separator') || cls.includes('spacer') ||
                 name.includes('separator') || name.includes('spacer')) {
                 return false;
             }
+            if (child.animatingOut) return false;
+            if (!_isIconSettled(child)) {
+                pending = true;
+                return false;
+            }
+            const w = child.get_width();
+            const h = child.get_height();
+            if (w < MIN_ICON_SIZE || h < MIN_ICON_SIZE) {
+                pending = true;
+                return false;
+            }
             return true;
         });
+
+        const changed = icons.length !== this._icons.length ||
+            icons.some((icon, i) => icon !== this._icons[i]);
+        this._icons = icons;
+        this._cacheDirty = pending;
+        return changed;
     }
 
     // ── Coordinate helpers ─────────────────────────────────────────────────────
@@ -318,20 +385,40 @@ class DockMagnifier {
         return [(parentBox.x1 + parentBox.x2) / 2, (parentBox.y1 + parentBox.y2) / 2];
     }
 
+    /** Returns the Show Apps button centre as [x, y] in iconsActor space. */
     _getShowAppsCenterInIconsActorSpace() {
         if (!this._showAppsIcon || !_isActorAlive(this._showAppsIcon)) return null;
         const [sx, sy] = this._showAppsIcon.get_transformed_position();
         const box = this._showAppsIcon.get_allocation_box();
         const stageCX = sx + (box.x2 - box.x1) / 2;
         const stageCY = sy + (box.y2 - box.y1) / 2;
-        const [ok, localX] = this._iconsActor.transform_stage_point(stageCX, stageCY);
-        return ok ? localX : null;
+        const [ok, localX, localY] = this._iconsActor.transform_stage_point(stageCX, stageCY);
+        return ok ? [localX, localY] : null;
+    }
+
+    /**
+     * True when the icons are laid out top-to-bottom (dock on the left or
+     * right). All distances along the dock use this axis.
+     */
+    _isVertical() {
+        const actor = this._iconsActor;
+        try {
+            const orientation = actor.orientation ?? actor.layout_manager?.orientation;
+            if (orientation !== undefined && orientation !== null)
+                return orientation === Clutter.Orientation.VERTICAL;
+            return Boolean(actor.vertical);
+        } catch (_) {
+            return false;
+        }
     }
 
     // ── Event handlers ─────────────────────────────────────────────────────────
 
     _onEnter(_actor, _event) {
         this._cancelRestoreTimeout();
+        // Re-validate on every entry: catches visibility/size changes that do
+        // not emit child-added/child-removed.
+        this._cacheDirty = true;
     }
 
     _onLeave(_actor, _event) {
@@ -339,12 +426,15 @@ class DockMagnifier {
     }
 
     _onMotion(_actor, event) {
+        // Indices into _icons are invalidated when the cache changes, so the
+        // magnification must be re-applied even if the index is the same.
+        const cacheChanged = this._ensureIconCache();
         if (this._icons.length === 0) return;
 
         const [pointerX, pointerY] = event.get_coords();
         const newIndex = this._iconIndexAtPointer(pointerX, pointerY);
 
-        if (newIndex === this._hoveredIndex) return;
+        if (!cacheChanged && newIndex === this._hoveredIndex) return;
 
         this._hoveredIndex = newIndex;
 
@@ -370,7 +460,7 @@ class DockMagnifier {
 
         for (let i = 0; i < this._icons.length; i++) {
             const icon = this._icons[i];
-            if (!_isActorAlive(icon) || !icon.visible) continue;
+            if (!_isActorAlive(icon) || !icon.visible || !_isIconSettled(icon)) continue;
 
             const center = this._getIconCenterInIconsActorSpace(icon);
             if (!center) continue;
@@ -382,13 +472,20 @@ class DockMagnifier {
             }
         }
 
-        const showAppsCenterX = this._getShowAppsCenterInIconsActorSpace();
-        if (showAppsCenterX !== null) {
+        const showAppsCenter = this._getShowAppsCenterInIconsActorSpace();
+        if (showAppsCenter !== null) {
+            // Position along the dock comes from the button itself; the
+            // cross-axis position is aligned with the icons (the button may
+            // live in a different container).
             const firstCenter = this._icons.length > 0
                 ? this._getIconCenterInIconsActorSpace(this._icons[0])
                 : null;
-            const showAppsCY = firstCenter ? firstCenter[1] : actorLocalY;
-            const dist = Math.hypot(actorLocalX - showAppsCenterX, actorLocalY - showAppsCY);
+            let [showAppsX, showAppsY] = showAppsCenter;
+            if (this._isVertical())
+                showAppsX = firstCenter ? firstCenter[0] : actorLocalX;
+            else
+                showAppsY = firstCenter ? firstCenter[1] : actorLocalY;
+            const dist = Math.hypot(actorLocalX - showAppsX, actorLocalY - showAppsY);
             if (dist < bestDist) {
                 bestDist = dist;
                 bestIndex = this._icons.length;
@@ -401,12 +498,14 @@ class DockMagnifier {
     }
 
     _getIconNominalSize() {
+        // Measure along the dock: across it, slots stretch to the dock size.
+        const vertical = this._isVertical();
         let totalW = 0;
         let count = 0;
         for (const icon of this._icons) {
-            if (!_isActorAlive(icon)) continue;
+            if (!_isActorAlive(icon) || !_isIconSettled(icon)) continue;
             const box = icon.get_allocation_box();
-            const w = box.x2 - box.x1;
+            const w = vertical ? box.y2 - box.y1 : box.x2 - box.x1;
             if (w > 0) { totalW += w; count++; }
         }
         return count > 0 ? totalW / count : 48;
@@ -421,15 +520,19 @@ class DockMagnifier {
         const iconSize = this._getIconNominalSize();
         const hoveredScale = (iconSize + zoomPx) / iconSize;
 
+        // Distances are measured along the dock axis (x for a horizontal
+        // dock, y for a vertical one).
+        const axis = this._isVertical() ? 1 : 0;
         const isShowAppsHovered = hoveredIdx >= this._icons.length;
-        let hoveredCenterX;
+        let hoveredPos;
         if (isShowAppsHovered) {
-            hoveredCenterX = this._getShowAppsCenterInIconsActorSpace();
-            if (hoveredCenterX === null) return;
+            const showAppsCenter = this._getShowAppsCenterInIconsActorSpace();
+            if (showAppsCenter === null) return;
+            hoveredPos = showAppsCenter[axis];
         } else {
             const center = this._getIconCenterInIconsActorSpace(this._icons[hoveredIdx]);
             if (!center) return;
-            hoveredCenterX = center[0];
+            hoveredPos = center[axis];
         }
 
         for (let i = 0; i < this._icons.length; i++) {
@@ -439,7 +542,7 @@ class DockMagnifier {
             const center = this._getIconCenterInIconsActorSpace(icon);
             if (!center) continue;
 
-            const pixelDist = Math.abs(center[0] - hoveredCenterX);
+            const pixelDist = Math.abs(center[axis] - hoveredPos);
             const ringDist = pixelDist / iconSize;
 
             const targetScale = i === hoveredIdx
@@ -449,9 +552,9 @@ class DockMagnifier {
         }
 
         if (this._showAppsIcon && _isActorAlive(this._showAppsIcon)) {
-            const showAppsCenterX = this._getShowAppsCenterInIconsActorSpace();
-            if (showAppsCenterX !== null) {
-                const pixelDist = Math.abs(showAppsCenterX - hoveredCenterX);
+            const showAppsCenter = this._getShowAppsCenterInIconsActorSpace();
+            if (showAppsCenter !== null) {
+                const pixelDist = Math.abs(showAppsCenter[axis] - hoveredPos);
                 const ringDist = pixelDist / iconSize;
                 const targetScale = isShowAppsHovered
                     ? hoveredScale
@@ -490,19 +593,9 @@ class DockMagnifier {
     }
 
     _restoreAllImmediate() {
-        for (const icon of this._icons) {
-            if (!_isActorAlive(icon)) continue;
-            try {
-                icon.set_scale(1.0, 1.0);
-                icon.remove_all_transitions();
-            } catch (_) {}
-        }
-        if (this._showAppsIcon && _isActorAlive(this._showAppsIcon)) {
-            try {
-                this._showAppsIcon.set_scale(1.0, 1.0);
-                this._showAppsIcon.remove_all_transitions();
-            } catch (_) {}
-        }
+        for (const icon of this._icons)
+            _resetIconScaleImmediate(icon);
+        _resetIconScaleImmediate(this._showAppsIcon);
     }
 }
 
@@ -518,8 +611,35 @@ function _isActorAlive(actor) {
     }
 }
 
+/**
+ * GNOME's DashItemContainer animates scale_x/scale_y (and opacity) when an
+ * icon enters (0 → 1) or leaves (1 → 0, then destroy). The magnifier must
+ * not touch the scale while such an animation runs: easing scale would
+ * replace GNOME's transition (cutting the entrance short, or cancelling the
+ * exit transition whose completion destroys the item).
+ */
+function _isIconSettled(actor) {
+    try {
+        if (actor.animatingOut) return false;
+        if (actor.get_transition('opacity')) return false;
+        return actor.scale_x >= 0.999 && actor.scale_y >= 0.999;
+    } catch (_) {
+        return false;
+    }
+}
+
+/** Removes only the magnifier's own scaling; leaves GNOME's animations alone. */
+function _resetIconScaleImmediate(actor) {
+    if (!actor || !_isActorAlive(actor) || !_isIconSettled(actor)) return;
+    try {
+        actor.remove_transition('scale-x');
+        actor.remove_transition('scale-y');
+        actor.set_scale(1.0, 1.0);
+    } catch (_) {}
+}
+
 function _animateIconScale(actor, scale, maxScale = 4.0) {
-    if (!_isActorAlive(actor)) return;
+    if (!_isActorAlive(actor) || !_isIconSettled(actor)) return;
 
     const duration = _settings?.get_int('anim-duration') ?? 120;
     const clamped = Math.max(1.0, Math.min(maxScale, scale));
